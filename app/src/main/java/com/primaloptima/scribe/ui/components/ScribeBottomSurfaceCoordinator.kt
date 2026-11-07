@@ -946,7 +946,9 @@ object ScribeBottomSurfaceCoordinator {
     ): EditorBottomGeometry {
         val imeAboveNav = (imeBottomDp - navBarBottomDp).coerceAtLeast(0f)
         val effectiveBottomSurface = when (presentationState) {
-            PresentationState.ACCESSORY_DRAWER_OPEN -> displayedDrawerHeightDp
+            PresentationState.ACCESSORY_DRAWER_OPEN -> {
+                if (displayedDrawerHeightDp > 0f) displayedDrawerHeightDp else imeAboveNav
+            }
             PresentationState.DRAWER_TO_KEYBOARD_HANDOFF -> handoffObstructionDp
             else -> imeAboveNav
         }

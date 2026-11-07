@@ -689,10 +689,29 @@ object ScribeScrollPolicy {
         val screenBottom = headerHeight + caretDocBottom - currentScrollY
         val screenTop = headerHeight + caretDocTop - currentScrollY
 
+        // If planned target is actively gliding to the breathing margin:
+        // Check if the planned target is safe and accurate in the settled viewport
+        if (plannedTargetScrollY >= 0f) {
+            val plannedScreenTop = headerHeight + caretDocTop - plannedTargetScrollY
+            val plannedScreenBottom = headerHeight + caretDocBottom - plannedTargetScrollY
+            val isPlannedSafe = plannedScreenTop >= -deadbandPx && plannedScreenBottom <= (targetLineBottom + deadbandPx)
+            // If the planned target lands safely at the breathing margin within tolerance, allow it to complete smoothly!
+            if (isPlannedSafe && kotlin.math.abs(plannedScreenBottom - targetLineBottom) <= (CURSOR_BOTTOM_MARGIN_DP * density * 0.75f)) {
+                return SettledReconciliationResult.NoOp
+            }
+        }
+
         val isSafeAtCurrent = screenTop >= -deadbandPx && screenBottom <= (targetLineBottom + deadbandPx)
         if (isSafeAtCurrent) {
             return if (plannedTargetScrollY >= 0f && kotlin.math.abs(plannedTargetScrollY - currentScrollY) > 1f) {
-                SettledReconciliationResult.CancelOvershoot
+                val plannedScreenTop = headerHeight + caretDocTop - plannedTargetScrollY
+                val plannedScreenBottom = headerHeight + caretDocBottom - plannedTargetScrollY
+                // Only cancel overshoot if planned target pushes caret off-screen at the top or overshoots far past breathing margin
+                if (plannedScreenTop < -deadbandPx || plannedScreenBottom < -deadbandPx || (plannedTargetScrollY > currentScrollY && screenBottom <= targetLineBottom * 0.5f)) {
+                    SettledReconciliationResult.CancelOvershoot
+                } else {
+                    SettledReconciliationResult.NoOp
+                }
             } else {
                 SettledReconciliationResult.NoOp
             }
@@ -946,7 +965,11 @@ object ScribeScrollPolicy {
         val targetTemp = if (request.isSurfaceExpanded) {
             requiredFromPersistent
         } else {
-            0f
+            // When returning to baseline from an expanded state:
+            // Ensure the caret remains above the keyboard and shortcut bar with breathing margin,
+            // while not exceeding the original temporary displacement.
+            val targetFromPersistent = safety.neededUpwardDisplacement.coerceAtLeast(0f)
+            minOf(request.currentTemporaryAdjustment, targetFromPersistent)
         }
 
         val maxAllowed = maxOf(0f, request.maxCanvasScroll)

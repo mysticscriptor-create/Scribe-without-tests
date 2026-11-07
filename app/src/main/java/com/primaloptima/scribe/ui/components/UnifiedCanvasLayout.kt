@@ -428,6 +428,7 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
     fun notifyDrawerOpeningStarting(targetObstructionPx: Float) {
         contractionRestoredBudgetPx = 0f
         isExpansionTransitionActive = false
+        preEntranceMaxCanvasScroll = naturalMaxCanvasScroll
         transitionCoordinator.startTransition(
             type = ScribeBottomSurfaceCoordinator.TransitionType.DRAWER_OPENING,
             startingObstructionPx = 0f,
@@ -440,6 +441,7 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
     fun notifyDrawerExpansionStarting(startingObstructionPx: Float, targetObstructionPx: Float, compactBaselinePx: Float = targetObstructionPx) {
         contractionRestoredBudgetPx = 0f
         isExpansionTransitionActive = true
+        preEntranceMaxCanvasScroll = naturalMaxCanvasScroll
         transitionCoordinator.startTransition(
             type = ScribeBottomSurfaceCoordinator.TransitionType.DRAWER_EXPANSION,
             startingObstructionPx = startingObstructionPx,
@@ -452,6 +454,7 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
     fun notifyDrawerContractionStarting(startingObstructionPx: Float, targetObstructionPx: Float, compactBaselinePx: Float = targetObstructionPx) {
         contractionRestoredBudgetPx = 0f
         isExpansionTransitionActive = false
+        preEntranceMaxCanvasScroll = naturalMaxCanvasScroll
         transitionCoordinator.startTransition(
             type = ScribeBottomSurfaceCoordinator.TransitionType.DRAWER_CONTRACTION,
             startingObstructionPx = startingObstructionPx,
@@ -462,8 +465,12 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
     }
 
     fun notifyDrawerSettledAtTarget(finalObstructionPx: Float = liveDrawerHeightPx) {
+        val activeType = transitionCoordinator.activeType
         transitionCoordinator.onSurfacePhysicallySettled(finalObstructionPx)
-        evaluateViewportAdjustment()
+        preEntranceMaxCanvasScroll = 0
+        if (activeType != ScribeBottomSurfaceCoordinator.TransitionType.DRAWER_OPENING) {
+            evaluateViewportAdjustment()
+        }
     }
 
     fun notifyImeSettledAtTarget(finalObstructionPx: Float = liveImeHeightPx) {
@@ -550,7 +557,8 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
         val currentScroll = (scrollD + editor.offsetY).toFloat()
         val caretScreenTop = headerHeight + caretDocTop - currentScroll
         val caretScreenBottom = headerHeight + caretDocBottom - currentScroll
-        val isCaretInView = caretScreenBottom >= 0f && caretScreenTop <= h
+        val deadbandPx = (ScribeScrollPolicy.CURSOR_DEADBAND_DP * density).coerceAtLeast(4f)
+        val isCaretInView = caretScreenBottom >= -deadbandPx && caretScreenTop <= (h + deadbandPx)
         if (!isCaretInView) {
             if (!isExpanded) {
                 scrollCoordinator.onViewportAdjustmentSettled(isSurfaceExpanded = false, forceFold = true)
@@ -575,7 +583,7 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
 
         val result = ScribeScrollPolicy.resolveViewportAdjustment(request)
 
-        if (result.foldAdjustmentIntoPersistent) {
+        if (result.foldAdjustmentIntoPersistent && !result.shouldScroll) {
             scrollCoordinator.persistentScrollPosition = result.newPersistentScrollPosition
             scrollCoordinator.temporaryViewportAdjustment = result.targetTemporaryAdjustment
         }
@@ -660,7 +668,7 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
         get() {
             val layoutH = editor.layout?.layoutHeight ?: 0
             val breathingMargin = breathingMarginPx.roundToInt()
-            val bottomSpace = if (isKeyboardVisible || isBottomSurfaceActive) {
+            val bottomSpace = if ((liveImeHeightPx > breathingMarginPx || liveDrawerHeightPx > breathingMarginPx) || (isKeyboardVisible && isImePhysicallySettled)) {
                 breathingMargin
             } else {
                 persistentBottomSpacePx.roundToInt()
@@ -681,8 +689,9 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
             val naturalMax = naturalMaxCanvasScroll
             val terminalScroll = transitionCoordinator.preservedDismissalScroll
             val genericScroll = genericRetainedScroll
+            val isSurfaceTransitionActive = isKeyboardTransactionActive || transitionCoordinator.isTransitionActive
             return when {
-                isKeyboardTransactionActive -> maxOf(preEntranceMaxCanvasScroll, naturalMax)
+                isSurfaceTransitionActive -> maxOf(preEntranceMaxCanvasScroll, naturalMax)
                 transitionCoordinator.isTerminalDismissalActive && terminalScroll != null -> maxOf(naturalMax, terminalScroll)
                 genericScroll != null -> maxOf(naturalMax, genericScroll)
                 else -> naturalMax
@@ -918,16 +927,16 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
             // Critically damped second-order spring:
             // Natural frequency omega = 13.5 rad/s gives ~300ms ultra-smooth gentle glide
             // Damping ratio zeta = 1.0 (critically damped: zero overshoot, perfectly smooth asymptotic settling)
-            // Sub-stepping for delta > 16ms to maintain physical accuracy on high-refresh/variable-rate displays
+            // Closed-form analytical integration eliminates frame-rate sensitivity and discrete Euler truncation error.
             val omega = 13.5f
-            val steps = if (realDtSec > 0.016f) 2 else 1
-            val dtSec = realDtSec / steps
-            for (step in 0 until steps) {
-                val displacement = glidePosition - glideTarget
-                val accel = -omega * omega * displacement - 2f * omega * glideVelocity
-                glideVelocity += accel * dtSec
-                glidePosition += glideVelocity * dtSec
-            }
+            val x0 = glidePosition - glideTarget
+            val v0 = glideVelocity
+            val t = realDtSec
+            val expTerm = kotlin.math.exp(-omega * t)
+            val c2 = v0 + omega * x0
+            val newDisplacement = (x0 + c2 * t) * expTerm
+            glideVelocity = (v0 - omega * c2 * t) * expTerm
+            glidePosition = glideTarget + newDisplacement
 
             // Hard boundary invariant: deletion glide must never cross the 24dp breathing margin
             if (activeGlideReason == ScribeScrollPolicy.ScrollAnimationReason.DELETION_ANCHOR) {
@@ -2217,10 +2226,10 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
         val screenBottom = headerRemaining + yOffset - editor.offsetY
         val screenTop = headerRemaining + yOffsetTop - editor.offsetY
 
-        val futureViewportHeight = if (isKeyboardOrDrawerActive && height > 0) {
-            height.toFloat()
-        } else if (targetEditorViewportHeightPx != null && targetEditorViewportHeightPx!! > 0f) {
+        val futureViewportHeight = if (targetEditorViewportHeightPx != null && targetEditorViewportHeightPx!! > 0f) {
             targetEditorViewportHeightPx!!
+        } else if (isKeyboardOrDrawerActive && (liveImeHeightPx > 0f || liveDrawerHeightPx > 0f)) {
+            height.toFloat()
         } else {
             val availableH = height.toFloat()
             val maxObstruction = if (availableH > 0f) minOf(estimatedKeyboardHeightPx, availableH * 0.55f) else estimatedKeyboardHeightPx
@@ -2262,7 +2271,7 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
 
         val overflow = if (screenBottom > targetLineBottom + deadbandPx) {
             screenBottom - targetLineBottom
-        } else if (screenTop < -deadbandPx) {
+        } else if (screenTop < -deadbandPx && !isUnresolvedTap && targetLine != null) {
             screenTop
         } else {
             0f
@@ -2384,10 +2393,10 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
             val density = resources.displayMetrics.density
             val marginPx = (ScribeScrollPolicy.CURSOR_BOTTOM_MARGIN_DP * density).roundToInt()
             val deadbandPx = (ScribeScrollPolicy.CURSOR_DEADBAND_DP * density).roundToInt()
-            val targetViewportH = if (isKeyboardVisible || isBottomSurfaceActive) {
-                height.toFloat()
-            } else if (targetEditorViewportHeightPx != null && targetEditorViewportHeightPx!! > 0f) {
+            val targetViewportH = if (targetEditorViewportHeightPx != null && targetEditorViewportHeightPx!! > 0f) {
                 targetEditorViewportHeightPx!!
+            } else if ((isKeyboardVisible || isBottomSurfaceActive) && (liveImeHeightPx > 0f || liveDrawerHeightPx > 0f)) {
+                height.toFloat()
             } else {
                 val availableH = height.toFloat()
                 val maxObstruction = if (availableH > 0f) minOf(estimatedKeyboardHeightPx, availableH * 0.55f) else estimatedKeyboardHeightPx
@@ -2757,7 +2766,9 @@ class UnifiedCanvasLayout @JvmOverloads constructor(
      * so that the typing cursor is strictly kept above the keyboard and shortcut bar.
      */
     override fun requestChildRectangleOnScreen(child: View, rectangle: Rect, immediate: Boolean): Boolean {
-        if (isKeyboardDismissing || suppressCursorVisibilityScroll || isRestoringViewport) {
+        val isDrawerTransition = transitionCoordinator.isTransitionActive ||
+                transitionCoordinator.activeType == ScribeBottomSurfaceCoordinator.TransitionType.DRAWER_OPENING
+        if (isKeyboardDismissing || suppressCursorVisibilityScroll || isRestoringViewport || isDrawerTransition) {
             return true
         }
         if (child !== editor) {
